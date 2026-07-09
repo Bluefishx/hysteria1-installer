@@ -46,6 +46,7 @@ detect_arch() {
     x86_64)  ARCH="amd64" ;;
     aarch64) ARCH="arm64" ;;
     armv7l)  ARCH="arm"   ;;
+    armv6l)  ARCH="arm"   ;;
     *)       error "Unsupported arch: $(uname -m)" ;;
   esac
 }
@@ -111,12 +112,21 @@ EOF
 }
 
 # --- Binary ----------------------------------------------------------
+# Correct repo: apernet/hysteria  (NOT HysteriaProject/Hysteria)
+# v1.x asset names: hysteria-linux-amd64 / hysteria-linux-arm64 / hysteria-linux-arm
 download_hysteria() {
   section "Downloading Hysteria $HYSTERIA_VERSION"
-  local url="https://github.com/HysteriaProject/Hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-${ARCH}"
-  curl -fsSL "$url" -o "$HYSTERIA_BIN"
+  local base_url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}"
+  local filename="hysteria-linux-${ARCH}"
+  local url="${base_url}/${filename}"
+
+  info "URL: $url"
+  if ! curl -fsSL "$url" -o "$HYSTERIA_BIN"; then
+    error "Download failed. Check your internet connection or try again later.\nURL was: $url"
+  fi
   chmod +x "$HYSTERIA_BIN"
   "$HYSTERIA_BIN" --version 2>/dev/null || true
+  info "Binary installed: $HYSTERIA_BIN"
 }
 
 # --- TLS cert --------------------------------------------------------
@@ -128,6 +138,7 @@ generate_cert() {
     -subj "/CN=${SERVER_HOST}/O=Hysteria/C=US" \
     -addext "subjectAltName=IP:${SERVER_HOST},DNS:${SERVER_HOST}" 2>/dev/null
   chmod 600 "$CERT_DIR/server.key"
+  info "Cert saved to $CERT_DIR"
 }
 
 # --- Users file ------------------------------------------------------
@@ -314,6 +325,7 @@ write_server_config() {
   "resolver": "8.8.8.8:53"
 }
 EOF
+  info "Config written: $CONFIG_FILE"
 }
 
 # --- Port-hopping ----------------------------------------------------
@@ -334,6 +346,7 @@ setup_port_hopping() {
     arch)
       iptables-save > /etc/iptables/iptables.rules 2>/dev/null || true ;;
   esac
+  info "Port-hopping active."
 }
 
 # --- Hysteria systemd service ----------------------------------------
@@ -360,6 +373,7 @@ EOF
   systemctl daemon-reload
   systemctl enable hysteria
   systemctl restart hysteria
+  info "Hysteria service started."
 }
 
 # --- Print client config ---------------------------------------------
