@@ -2,6 +2,10 @@
 # ============================================================
 #  Hysteria v1 UDP Server Installer
 #  Port-hopping · OBFS · Multi-user Auth · BBR · Kernel Tuning
+#
+#  Auth: passwords mode  →  auth_str = "username:password"
+#  Users stored in /etc/hysteria/users.json {user: pass}
+#  Config rebuilt from users.json on every add/edit/delete
 # ============================================================
 set -euo pipefail
 
@@ -13,14 +17,10 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/hysteria"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 USERS_FILE="$CONFIG_DIR/users.json"
-AUTH_SERVER="$CONFIG_DIR/auth_server.py"
-AUTH_SERVICE="/etc/systemd/system/hysteria-auth.service"
 SERVICE_FILE="/etc/systemd/system/hysteria.service"
 LOG_FILE="/var/log/hysteria.log"
-AUTH_LOG="/var/log/hysteria-auth.log"
 CERT_DIR="$CONFIG_DIR/certs"
 HYSTERIA_BIN="$INSTALL_DIR/hysteria"
-AUTH_PORT=9527
 
 DEFAULT_PORT_START=10000
 DEFAULT_PORT_END=50000
@@ -43,13 +43,13 @@ detect_os() {
 
 detect_arch() {
   case "$(uname -m)" in
-    'i386' | 'i686')       ARCH='386'    ;;
-    'amd64' | 'x86_64')    ARCH='amd64'  ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCH='arm' ;;
-    'armv8' | 'aarch64')   ARCH='arm64'  ;;
-    'mips' | 'mipsle' | 'mips64' | 'mips64le') ARCH='mipsle' ;;
-    's390x')               ARCH='s390x'  ;;
-    *)       error "Unsupported arch: $(uname -m)" ;;
+    'i386'|'i686')                          ARCH='386'    ;;
+    'amd64'|'x86_64')                       ARCH='amd64'  ;;
+    'armv5tel'|'armv6l'|'armv7'|'armv7l')  ARCH='arm'    ;;
+    'armv8'|'aarch64')                      ARCH='arm64'  ;;
+    'mips'|'mipsle'|'mips64'|'mips64le')   ARCH='mipsle' ;;
+    's390x')                                ARCH='s390x'  ;;
+    *) error "Unsupported arch: $(uname -m)" ;;
   esac
 }
 
@@ -116,7 +116,8 @@ EOF
 
 # --- Binary ----------------------------------------------------------
 # Official repo: apernet/hysteria
-# v1.x binary naming: hysteria-linux-amd64 / arm64 / arm / mipsle / s390x
+# v1.x binary: hysteria-linux-{arch}
+# v1 CLI:  hysteria -config config.json server
 download_hysteria() {
   section "Downloading Hysteria $HYSTERIA_VERSION"
   local url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-${ARCH}"
@@ -142,6 +143,8 @@ generate_cert() {
 }
 
 # --- Users file ------------------------------------------------------
+# Format: { "username": "password", ... }
+# auth_str sent by client = "username:password"
 init_users_file() {
   mkdir -p "$CONFIG_DIR"
   if [[ ! -f "$USERS_FILE" ]]; then
@@ -160,7 +163,7 @@ try:
 except: data = {}
 data[user] = pw
 json.dump(data, open(f,'w'), indent=2)
-print(f"  Added user: {user}")
+print(f"  Added: {user}")
 PYEOF
 }
 
@@ -175,7 +178,7 @@ except: data = {}
 if user in data:
     del data[user]
     json.dump(data, open(f,'w'), indent=2)
-    print(f"  Deleted user: {user}")
+    print(f"  Deleted: {user}")
 else:
     print(f"  User not found: {user}")
 PYEOF
@@ -190,113 +193,82 @@ except: data = {}
 if not data:
     print("  (no users)")
 else:
-    print(f"  {'#':<4} {'Username':<24} {'Password'}")
-    print(f"  {'-'*4} {'-'*24} {'-'*24}")
+    print(f"  {'#':<4} {'Username':<24} {'Password':<24} {'auth_str (user:pass)'}")
+    print(f"  {'-'*4} {'-'*24} {'-'*24} {'-'*30}")
     for i,(u,p) in enumerate(data.items(),1):
-        print(f"  {i:<4} {u:<24} {p}")
+        print(f"  {i:<4} {u:<24} {p:<24} {u}:{p}")
 PYEOF
 }
 
 user_edit_password() {
   local username="$1" new_password="$2"
   user_add "$username" "$new_password"
-  echo "  Password updated for: $username"
 }
 
-# --- Python auth server ----------------------------------------------
-write_auth_server() {
-  section "Writing multi-user auth server"
-  cat > "$AUTH_SERVER" <<'PYEOF'
-#!/usr/bin/env python3
-"""
-Hysteria v1 external auth server.
-Reads /etc/hysteria/users.json  {username: password, ...}
-Any client whose auth_str matches a password in the file is allowed.
-"""
-import json, logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
+# --- Build passwords array from users.json and write config ----------
+# Hysteria v1 passwords mode:
+#   auth.mode = "passwords"
+#   auth.config = ["user1:pass1", "user2:pass2", ...]
+#   client sends auth_str = "username:password"
+rebuild_config() {
+  local obfs; obfs=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('obfs',''))" 2>/dev/null || echo "$OBFS_KEY")
+  local listen; listen=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('listen',':$DEFAULT_PORT_START'))" 2>/dev/null || echo ":$DEFAULT_PORT_START")
+  local up; up=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('up_mbps',$DEFAULT_UP_MBPS))" 2>/dev/null || echo "$DEFAULT_UP_MBPS")
+  local down; down=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('down_mbps',$DEFAULT_DOWN_MBPS))" 2>/dev/null || echo "$DEFAULT_DOWN_MBPS")
 
-USERS_FILE  = "/etc/hysteria/users.json"
-LOG_FILE    = "/var/log/hysteria-auth.log"
-LISTEN_PORT = 9527
+  python3 - "$USERS_FILE" "$CONFIG_FILE" "$obfs" "$listen" "$up" "$down" \
+    "${CERT_DIR}/server.crt" "${CERT_DIR}/server.key" <<'PYEOF'
+import json, sys
+users_file, config_file = sys.argv[1], sys.argv[2]
+obfs, listen, up, down = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+cert, key = sys.argv[7], sys.argv[8]
 
-logging.basicConfig(
-    filename=LOG_FILE, level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+try:
+    users = json.load(open(users_file))
+except: users = {}
 
-def load_passwords():
-    try:
-        with open(USERS_FILE) as f:
-            return set(json.load(f).values())
-    except Exception as e:
-        logging.error(f"Cannot read users file: {e}")
-        return set()
+# Build passwords list: ["user:pass", ...]
+passwords = [f"{u}:{p}" for u,p in users.items()]
 
-class AuthHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-    def do_POST(self):
-        length  = int(self.headers.get("Content-Length", 0))
-        body    = self.rfile.read(length)
-        allowed = False
-        try:
-            data     = json.loads(body)
-            auth_str = data.get("auth", "")
-            addr     = data.get("addr", "?")
-            allowed  = auth_str in load_passwords()
-            logging.info(f"{'ALLOW' if allowed else 'DENY'} addr={addr} auth={auth_str[:4]}***")
-        except Exception as e:
-            logging.error(f"Bad request: {e}")
-
-        resp = json.dumps({"ok": allowed}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(resp)))
-        self.end_headers()
-        self.wfile.write(resp)
-
-if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", LISTEN_PORT), AuthHandler)
-    logging.info(f"Auth server listening on 127.0.0.1:{LISTEN_PORT}")
-    server.serve_forever()
+config = {
+    "listen": listen,
+    "cert":   cert,
+    "key":    key,
+    "obfs":   obfs,
+    "auth": {
+        "mode":   "passwords",
+        "config": passwords
+    },
+    "up_mbps":            int(up),
+    "down_mbps":          int(down),
+    "recv_window_conn":   524288,
+    "recv_window_client": 2097152,
+    "max_conn_client":    4096,
+    "handshake_timeout":  10,
+    "idle_timeout":       60
+}
+json.dump(config, open(config_file,'w'), indent=2)
+print(f"  Config rebuilt with {len(passwords)} user(s).")
 PYEOF
-  chmod +x "$AUTH_SERVER"
 }
 
-# --- Auth server systemd service -------------------------------------
-setup_auth_service() {
-  cat > "$AUTH_SERVICE" <<EOF
-[Unit]
-Description=Hysteria v1 Multi-user Auth Server
-After=network.target
-Before=hysteria.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 ${AUTH_SERVER}
-Restart=on-failure
-RestartSec=3
-StandardOutput=append:${AUTH_LOG}
-StandardError=append:${AUTH_LOG}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable hysteria-auth
-  systemctl restart hysteria-auth
-  info "Auth server started on 127.0.0.1:${AUTH_PORT}"
-}
-
-# --- Hysteria v1 server config ---------------------------------------
-# v1 config rules:
-#   - cert/key are TOP-LEVEL fields (NOT nested under "tls")
-#   - "resolver" field NOT supported in v1 (causes crash)
-#   - NO "disable_mtu_discovery" field in v1
+# --- Write initial server config -------------------------------------
+# Called only on first install (uses shell vars from prompt_config)
 write_server_config() {
   section "Writing server configuration"
+
+  # Build initial passwords list from users.json
+  local passwords_json
+  passwords_json=$(python3 - "$USERS_FILE" <<'PYEOF'
+import json, sys
+try:
+    users = json.load(open(sys.argv[1]))
+except: users = {}
+passwords = [f"{u}:{p}" for u,p in users.items()]
+print(json.dumps(passwords))
+PYEOF
+  )
+
   cat > "$CONFIG_FILE" <<EOF
 {
   "listen": ":${PORT_START}",
@@ -304,18 +276,16 @@ write_server_config() {
   "key":  "${CERT_DIR}/server.key",
   "obfs": "${OBFS_KEY}",
   "auth": {
-    "mode": "external",
-    "config": {
-      "addr": "http://127.0.0.1:${AUTH_PORT}/"
-    }
+    "mode":   "passwords",
+    "config": ${passwords_json}
   },
-  "up_mbps":   ${SERVER_UP},
-  "down_mbps": ${SERVER_DOWN},
+  "up_mbps":            ${SERVER_UP},
+  "down_mbps":          ${SERVER_DOWN},
   "recv_window_conn":   524288,
   "recv_window_client": 2097152,
-  "max_conn_client": 4096,
-  "handshake_timeout": 10,
-  "idle_timeout": 60
+  "max_conn_client":    4096,
+  "handshake_timeout":  10,
+  "idle_timeout":       60
 }
 EOF
   info "Config written: $CONFIG_FILE"
@@ -334,25 +304,20 @@ setup_port_hopping() {
     debian)
       apt-get install -y -qq iptables-persistent 2>/dev/null || true
       netfilter-persistent save 2>/dev/null || true ;;
-    rhel)
-      service iptables save 2>/dev/null || true ;;
-    arch)
-      iptables-save > /etc/iptables/iptables.rules 2>/dev/null || true ;;
+    rhel)  service iptables save 2>/dev/null || true ;;
+    arch)  iptables-save > /etc/iptables/iptables.rules 2>/dev/null || true ;;
   esac
   info "Port-hopping active."
 }
 
 # --- Hysteria systemd service ----------------------------------------
-# IMPORTANT: Hysteria v1 CLI syntax is:
-#   hysteria -config <file> server
-# NOT: hysteria server --config <file>
+# v1 CLI: hysteria -config <file> server
 setup_service() {
   section "Setting up Hysteria service"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Hysteria v1 UDP Server
-After=network.target hysteria-auth.service
-Requires=hysteria-auth.service
+After=network.target
 
 [Service]
 Type=simple
@@ -376,12 +341,16 @@ EOF
 # --- Print client config ---------------------------------------------
 print_client_config() {
   local username="$1" password="$2"
+  local server_ip; server_ip=$(curl -4 -fsSL ifconfig.me 2>/dev/null || echo "?")
+  local obfs; obfs=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('obfs',''))" 2>/dev/null || echo "")
+  local port; port=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('listen',':$DEFAULT_PORT_START').lstrip(':'))" 2>/dev/null || echo "$DEFAULT_PORT_START")
+
   echo -e "\n${BOLD}Client config for user: ${CYAN}${username}${NC}"
   cat <<EOF
 {
-  "server":   "${SERVER_HOST}:${PORT_START}-${PORT_END}",
-  "obfs":     "${OBFS_KEY}",
-  "auth_str": "${password}",
+  "server":   "${server_ip}:${port}-${DEFAULT_PORT_END}",
+  "obfs":     "${obfs}",
+  "auth_str": "${username}:${password}",
   "up_mbps":  1,
   "down_mbps": 2,
   "retry": 3,
@@ -400,16 +369,18 @@ EOF
 
 # --- Server info banner ----------------------------------------------
 print_server_info() {
-  local obfs; obfs=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['obfs'])")
-  local port; port=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['listen'].lstrip(':'))")
+  local obfs; obfs=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('obfs',''))")
+  local port; port=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('listen','').lstrip(':'))")
   local ip;   ip=$(curl -4 -fsSL ifconfig.me 2>/dev/null || echo '?')
+  local users; users=$(python3 -c "import json; d=json.load(open('$USERS_FILE')); print(len(d))" 2>/dev/null || echo '?')
   echo -e "${YELLOW}╔══════════════════════════════════════════════╗"
   echo -e "║         HYSTERIA v1  –  SERVER INFO          ║"
   echo -e "╠══════════════════════════════════════════════╣"
   echo -e "║  IP         : $ip"
   echo -e "║  Port range : ${port}-${DEFAULT_PORT_END} UDP"
   echo -e "║  OBFS       : $obfs"
-  echo -e "║  Auth mode  : multi-user (external)"
+  echo -e "║  Auth mode  : passwords (user:pass)"
+  echo -e "║  Users      : $users"
   echo -e "╚══════════════════════════════════════════════╝${NC}"
 }
 
@@ -451,7 +422,7 @@ user_menu() {
     read -rp "Choose: " choice
     case $choice in
       1)
-        section "Users"
+        section "Users  (auth_str = username:password)"
         user_list ;;
       2)
         read -rp "  Username: " uname
@@ -460,8 +431,9 @@ user_menu() {
         read -rp "  Password [auto: ${auto_pw}]: " upw
         upw="${upw:-$auto_pw}"
         user_add "$uname" "$upw"
-        systemctl restart hysteria-auth 2>/dev/null || true
-        info "User added. Auth server reloaded." ;;
+        rebuild_config
+        systemctl restart hysteria 2>/dev/null || true
+        info "User added. Hysteria restarted with new passwords." ;;
       3)
         read -rp "  Username to edit: " uname
         [[ -z "$uname" ]] && warn "Username cannot be empty." && continue
@@ -469,16 +441,18 @@ user_menu() {
         read -rp "  New password [auto: ${auto_pw}]: " upw
         upw="${upw:-$auto_pw}"
         user_edit_password "$uname" "$upw"
-        systemctl restart hysteria-auth 2>/dev/null || true
-        info "Password updated. Auth server reloaded." ;;
+        rebuild_config
+        systemctl restart hysteria 2>/dev/null || true
+        info "Password updated. Hysteria restarted." ;;
       4)
         read -rp "  Username to delete: " uname
         [[ -z "$uname" ]] && warn "Username cannot be empty." && continue
         read -rp "  Confirm delete '${uname}'? [y/N]: " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { info "Cancelled."; continue; }
         user_delete "$uname"
-        systemctl restart hysteria-auth 2>/dev/null || true
-        info "User deleted. Auth server reloaded." ;;
+        rebuild_config
+        systemctl restart hysteria 2>/dev/null || true
+        info "User deleted. Hysteria restarted." ;;
       5)
         read -rp "  Username: " uname
         [[ -z "$uname" ]] && warn "Username cannot be empty." && continue
@@ -494,12 +468,6 @@ PYEOF
         if [[ -z "$pw" ]]; then
           warn "User '$uname' not found."
         else
-          local obfs; obfs=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['obfs'])")
-          local port_start; port_start=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['listen'].lstrip(':'))")
-          SERVER_HOST=$(curl -4 -fsSL ifconfig.me 2>/dev/null || echo "?")
-          OBFS_KEY="$obfs"
-          PORT_START="$port_start"
-          PORT_END="${DEFAULT_PORT_END}"
           print_client_config "$uname" "$pw"
         fi ;;
       0) break ;;
@@ -512,32 +480,30 @@ PYEOF
 manage_menu() {
   while true; do
     echo -e "\n${BOLD}${CYAN}-- Hysteria Management --------------------------------${NC}"
-    echo "  1) Start services"
-    echo "  2) Stop services"
-    echo "  3) Restart services"
+    echo "  1) Start"
+    echo "  2) Stop"
+    echo "  3) Restart"
     echo "  4) Status"
-    echo "  5) View Hysteria log"
-    echo "  6) View Auth log"
-    echo "  7) Server info"
-    echo "  8) User management  <--"
-    echo "  9) Uninstall"
+    echo "  5) View log"
+    echo "  6) Server info"
+    echo "  7) User management  <--"
+    echo "  8) Uninstall"
     echo "  0) Exit"
     read -rp "Choose: " choice
     case $choice in
-      1) systemctl start hysteria-auth hysteria; info "Started." ;;
-      2) systemctl stop hysteria hysteria-auth;  info "Stopped." ;;
-      3) systemctl restart hysteria-auth; sleep 1; systemctl restart hysteria; info "Restarted." ;;
-      4) systemctl status hysteria hysteria-auth --no-pager ;;
+      1) systemctl start hysteria; info "Started." ;;
+      2) systemctl stop hysteria;  info "Stopped." ;;
+      3) systemctl restart hysteria; info "Restarted." ;;
+      4) systemctl status hysteria --no-pager ;;
       5) tail -n 60 "$LOG_FILE" ;;
-      6) tail -n 60 "$AUTH_LOG" ;;
-      7) print_server_info ;;
-      8) user_menu ;;
-      9)
+      6) print_server_info ;;
+      7) user_menu ;;
+      8)
         read -rp "  Confirm full uninstall? [y/N]: " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { info "Cancelled."; continue; }
-        systemctl stop hysteria hysteria-auth 2>/dev/null || true
-        systemctl disable hysteria hysteria-auth 2>/dev/null || true
-        rm -f "$SERVICE_FILE" "$AUTH_SERVICE" "$HYSTERIA_BIN"
+        systemctl stop hysteria 2>/dev/null || true
+        systemctl disable hysteria 2>/dev/null || true
+        rm -f "$SERVICE_FILE" "$HYSTERIA_BIN"
         rm -rf "$CONFIG_DIR"
         iptables -t nat -D PREROUTING -p udp \
           --dport "${DEFAULT_PORT_START}:${DEFAULT_PORT_END}" \
@@ -559,7 +525,7 @@ main() {
   echo "  ██╔══██║  ╚██╔╝  ╚════██║   ██║   ██╔══╝  ██╔══██╗██║██╔══██║"
   echo "  ██║  ██║   ██║   ███████║   ██║   ███████╗██║  ██║██║██║  ██║"
   echo "  ╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═╝"
-  echo -e "  v1 · Port-hopping · OBFS · Multi-user Auth · BBR${NC}\n"
+  echo -e "  v1 · Port-hopping · OBFS · passwords auth · BBR${NC}\n"
 
   require_root
   detect_os
@@ -578,12 +544,10 @@ main() {
   download_hysteria
   generate_cert
   init_users_file
-  write_auth_server
-  setup_auth_service
 
   section "Create first user"
   local first_user first_pw
-  read -rp "  First username: " first_user
+  read -rp "  Username: " first_user
   first_user="${first_user:-admin}"
   local auto_pw; auto_pw=$(gen_password)
   read -rp "  Password [auto: ${auto_pw}]: " first_pw
