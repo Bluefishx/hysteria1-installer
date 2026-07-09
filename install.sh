@@ -72,7 +72,8 @@ enable_bbr() {
   minor=$(uname -r | cut -d. -f2)
   if (( major > 4 )) || (( major == 4 && minor >= 9 )); then
     modprobe tcp_bbr 2>/dev/null || true
-    grep -qx "tcp_bbr" /etc/modules-load.d/modules.conf 2>/dev/null || echo "tcp_bbr" >> /etc/modules-load.d/modules.conf
+    grep -qx "tcp_bbr" /etc/modules-load.d/modules.conf 2>/dev/null || \
+      echo "tcp_bbr" >> /etc/modules-load.d/modules.conf
     cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -112,17 +113,14 @@ EOF
 }
 
 # --- Binary ----------------------------------------------------------
-# Correct repo: apernet/hysteria  (NOT HysteriaProject/Hysteria)
-# v1.x asset names: hysteria-linux-amd64 / hysteria-linux-arm64 / hysteria-linux-arm
+# Official repo: apernet/hysteria
+# v1.x asset names: hysteria-linux-amd64 / arm64 / arm
 download_hysteria() {
   section "Downloading Hysteria $HYSTERIA_VERSION"
-  local base_url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}"
-  local filename="hysteria-linux-${ARCH}"
-  local url="${base_url}/${filename}"
-
+  local url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-${ARCH}"
   info "URL: $url"
   if ! curl -fsSL "$url" -o "$HYSTERIA_BIN"; then
-    error "Download failed. Check your internet connection or try again later.\nURL was: $url"
+    error "Download failed.\nURL: $url"
   fi
   chmod +x "$HYSTERIA_BIN"
   "$HYSTERIA_BIN" --version 2>/dev/null || true
@@ -290,39 +288,32 @@ EOF
   info "Auth server started on 127.0.0.1:${AUTH_PORT}"
 }
 
-# --- Hysteria server config ------------------------------------------
+# --- Hysteria v1 server config ---------------------------------------
+# v1 config rules:
+#   - cert and key are TOP-LEVEL fields (NOT nested under "tls")
+#   - "resolver" field is NOT supported (causes "invalid syntax" error)
+#   - "disable_mtu_discovery" is NOT a valid v1 field, omit it
 write_server_config() {
   section "Writing server configuration"
   cat > "$CONFIG_FILE" <<EOF
 {
   "listen": ":${PORT_START}",
-
-  "tls": {
-    "cert": "${CERT_DIR}/server.crt",
-    "key":  "${CERT_DIR}/server.key"
-  },
-
+  "cert": "${CERT_DIR}/server.crt",
+  "key":  "${CERT_DIR}/server.key",
   "obfs": "${OBFS_KEY}",
-
   "auth": {
     "mode": "external",
     "config": {
       "addr": "http://127.0.0.1:${AUTH_PORT}/"
     }
   },
-
   "up_mbps":   ${SERVER_UP},
   "down_mbps": ${SERVER_DOWN},
-
   "recv_window_conn":   524288,
   "recv_window_client": 2097152,
-
   "max_conn_client": 4096,
   "handshake_timeout": 10,
-  "idle_timeout": 60,
-  "disable_mtu_discovery": false,
-
-  "resolver": "8.8.8.8:53"
+  "idle_timeout": 60
 }
 EOF
   info "Config written: $CONFIG_FILE"
