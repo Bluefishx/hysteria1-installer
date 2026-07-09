@@ -43,10 +43,12 @@ detect_os() {
 
 detect_arch() {
   case "$(uname -m)" in
-    x86_64)  ARCH="amd64" ;;
-    aarch64) ARCH="arm64" ;;
-    armv7l)  ARCH="arm"   ;;
-    armv6l)  ARCH="arm"   ;;
+    'i386' | 'i686')       ARCH='386'    ;;
+    'amd64' | 'x86_64')    ARCH='amd64'  ;;
+    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCH='arm' ;;
+    'armv8' | 'aarch64')   ARCH='arm64'  ;;
+    'mips' | 'mipsle' | 'mips64' | 'mips64le') ARCH='mipsle' ;;
+    's390x')               ARCH='s390x'  ;;
     *)       error "Unsupported arch: $(uname -m)" ;;
   esac
 }
@@ -114,7 +116,7 @@ EOF
 
 # --- Binary ----------------------------------------------------------
 # Official repo: apernet/hysteria
-# v1.x asset names: hysteria-linux-amd64 / arm64 / arm
+# v1.x binary naming: hysteria-linux-amd64 / arm64 / arm / mipsle / s390x
 download_hysteria() {
   section "Downloading Hysteria $HYSTERIA_VERSION"
   local url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-${ARCH}"
@@ -123,7 +125,7 @@ download_hysteria() {
     error "Download failed.\nURL: $url"
   fi
   chmod +x "$HYSTERIA_BIN"
-  "$HYSTERIA_BIN" --version 2>/dev/null || true
+  "$HYSTERIA_BIN" -v 2>/dev/null || true
   info "Binary installed: $HYSTERIA_BIN"
 }
 
@@ -290,9 +292,9 @@ EOF
 
 # --- Hysteria v1 server config ---------------------------------------
 # v1 config rules:
-#   - cert and key are TOP-LEVEL fields (NOT nested under "tls")
-#   - "resolver" field is NOT supported (causes "invalid syntax" error)
-#   - "disable_mtu_discovery" is NOT a valid v1 field, omit it
+#   - cert/key are TOP-LEVEL fields (NOT nested under "tls")
+#   - "resolver" field NOT supported in v1 (causes crash)
+#   - NO "disable_mtu_discovery" field in v1
 write_server_config() {
   section "Writing server configuration"
   cat > "$CONFIG_FILE" <<EOF
@@ -341,6 +343,9 @@ setup_port_hopping() {
 }
 
 # --- Hysteria systemd service ----------------------------------------
+# IMPORTANT: Hysteria v1 CLI syntax is:
+#   hysteria -config <file> server
+# NOT: hysteria server --config <file>
 setup_service() {
   section "Setting up Hysteria service"
   cat > "$SERVICE_FILE" <<EOF
@@ -351,7 +356,8 @@ Requires=hysteria-auth.service
 
 [Service]
 Type=simple
-ExecStart=${HYSTERIA_BIN} server --config ${CONFIG_FILE}
+ExecStart=${HYSTERIA_BIN} -config ${CONFIG_FILE} server
+WorkingDirectory=${CONFIG_DIR}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
